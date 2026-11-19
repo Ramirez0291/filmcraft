@@ -134,7 +134,7 @@ fn rendered(s: &mut Session, seq_id: ItemId, clip: ClipId, dir: &std::path::Path
 }
 
 fn pending(s: &Session, seq_id: ItemId, clips: Vec<Rendered>) -> PendingFlow {
-    let look = Look { mode: FlowVizMode::HsvWheel, max_motion: 16.0, opacity: 85.0, blend: Blend::Screen.index() };
+    let look = Look { mode: TrackMode::Flow(FlowVizMode::HsvWheel), max_motion: 16.0, opacity: 85.0, blend: Blend::Screen.index() };
     let outcome = Outcome { clips, cpu_frames: 4, ..Default::default() };
     PendingFlow {
         job: u64::MAX,
@@ -273,4 +273,31 @@ fn dlss_enhance_mode_places_normal_blend_full_opacity_clip_above() {
     let op = it.effects.iter().find(|e| e.effect == "opacity").unwrap();
     assert_eq!(op.params["blend"].value, ParamValue::Choice(Blend::Normal.index()));
     assert_eq!(op.params["opacity"].value, ParamValue::Float(100.0));
+}
+
+#[cfg(windows)]
+#[test]
+#[ignore = "requires Visual Enhancer v23.6 and a compatible NVIDIA GPU"]
+fn visual_enhancer_places_a_track_and_restores_translucent_pixels() {
+    let (mut s, seq_id, clip, start, dur) = demo(3);
+    s.execute("sequence.settings", json!({"width": 320, "height": 192})).unwrap();
+    s.execute("effects.setParam", json!({"clip":clip.0,"effect":"opacity","param":"opacity","value":25.0})).unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let res = s.execute("clip.visualEnhancer.neuralRendering", json!({"clips":[clip.0],"dir":dir.path(),"wait":true})).unwrap();
+    assert_eq!(res["reconstructionHardwareFrames"], 3);
+    assert_eq!(res["overlayGpuFrames"], 0);
+    let placed = ClipId(res["clips"][0].as_u64().unwrap());
+    let (track, item) = overlay_of(&s, seq_id, placed);
+    assert!(track > 0);
+    assert_eq!((item.start, item.duration), (start, dur));
+    let provider = s.media.full_res_provider(s.project.clone(), s.services.clone()).own_sources();
+    let frame = render_sequence_track(&s.project, seq_id, track, start, RenderOptions::default(), &provider);
+    let reference = render_sequence_track(&s.project, seq_id, 0, start, RenderOptions::default(), &provider);
+    assert_eq!((frame.w, frame.h), (reference.w, reference.h));
+    assert!(reference.px.as_chunks::<4>().0.iter().any(|p| (p[3] - 0.25).abs() < 0.005));
+    for (src, enhanced) in reference.px.as_chunks::<4>().0.iter().zip(frame.px.as_chunks::<4>().0) {
+        assert!((src[3] - enhanced[3]).abs() < 0.005, "alpha {} became {}", src[3], enhanced[3]);
+    }
+    s.execute("edit.undo", json!({})).unwrap();
+    assert!(s.project.sequence(seq_id).unwrap().find_item(placed).is_none());
 }

@@ -32,6 +32,9 @@ use serde_json::{Value, json};
 use crate::commands::{CommandSpec, bad, bool_p, clips_p, f64_p, has_seq, str_p};
 use crate::{EngineError, Result, Session};
 
+#[cfg(windows)]
+mod visual_enhancer;
+
 /// Most frames one job renders over all its clips (an hour at 60 fps). A project can store any
 /// clip duration, so the schedule is capped up front: a longer selection is an error, never a
 /// silently shorter overlay.
@@ -56,9 +59,9 @@ pub(crate) fn commands() -> Vec<CommandSpec> {
             "clip.opticalFlowOverlay",
             "Generate Optical Flow Track…",
             // parameterised (any mode): for agents and the timeline menu's enabled check; the menus
-            // show the four modes below
+            // show the platform-supported modes below
             &[],
-            r#"{"clips":[id]?,"mode":"hsvWheel|motionVectors|kineticGlow|dlssEnhance"?,"maxMotion":f64=16,"opacity":f64?,"blendMode":str?,"dir":str?,"wait":bool=false}"#,
+            r#"{"clips":[id]?,"mode":"hsvWheel|motionVectors|kineticGlow|dlssEnhance|visualEnhancerNR"?,"maxMotion":f64=16,"opacity":f64?,"blendMode":str?,"dir":str?,"wait":bool=false}"#,
             |s, p| run_overlay(s, p, None),
         ),
         spec(
@@ -66,28 +69,36 @@ pub(crate) fn commands() -> Vec<CommandSpec> {
             "HSV Neon Flow Wheel",
             &["Clip", "Video Options", "Optical Flow Track"],
             r#"{"clips":[id]?,"maxMotion":f64=16,"opacity":f64?,"blendMode":str?,"dir":str?,"wait":bool=false}"#,
-            |s, p| run_overlay(s, p, Some(FlowVizMode::HsvWheel)),
+            |s, p| run_overlay(s, p, Some(TrackMode::Flow(FlowVizMode::HsvWheel))),
         ),
         spec(
             "clip.opticalFlowOverlay.motionVectors",
             "Motion Vectors (UV Pass)",
             &["Clip", "Video Options", "Optical Flow Track"],
             r#"{"clips":[id]?,"maxMotion":f64=16,"opacity":f64?,"blendMode":str?,"dir":str?,"wait":bool=false}"#,
-            |s, p| run_overlay(s, p, Some(FlowVizMode::MotionVectors)),
+            |s, p| run_overlay(s, p, Some(TrackMode::Flow(FlowVizMode::MotionVectors))),
         ),
         spec(
             "clip.opticalFlowOverlay.kineticGlow",
             "Kinetic Motion Glow",
             &["Clip", "Video Options", "Optical Flow Track"],
             r#"{"clips":[id]?,"maxMotion":f64=16,"opacity":f64?,"blendMode":str?,"dir":str?,"wait":bool=false}"#,
-            |s, p| run_overlay(s, p, Some(FlowVizMode::KineticGlow)),
+            |s, p| run_overlay(s, p, Some(TrackMode::Flow(FlowVizMode::KineticGlow))),
         ),
         spec(
             "clip.opticalFlowOverlay.dlssEnhance",
             FlowVizMode::DlssEnhance.label(),
             &["Clip", "Video Options", "Optical Flow Track"],
             r#"{"clips":[id]?,"maxMotion":f64=16,"opacity":f64?,"blendMode":str?,"dir":str?,"wait":bool=false}"#,
-            |s, p| run_overlay(s, p, Some(FlowVizMode::DlssEnhance)),
+            |s, p| run_overlay(s, p, Some(TrackMode::Flow(FlowVizMode::DlssEnhance))),
+        ),
+        #[cfg(windows)]
+        spec(
+            "clip.visualEnhancer.neuralRendering",
+            NR_LABEL,
+            &["Clip", "Video Options", "Optical Flow Track"],
+            r#"{"clips":[id]?,"style":0|1|2?,"strength":0..2?,"dir":str?,"wait":bool=false}"#,
+            |s, p| run_overlay(s, p, Some(TrackMode::NeuralRendering)),
         ),
     ]
 }
@@ -129,24 +140,47 @@ fn find_free_video_track_above(p: &Project, seq_id: ItemId, above_track_idx: usi
         .map(|(_, t)| t.id)
 }
 
-fn parse_blend_index(cmd: &str, name: Option<&str>, mode: FlowVizMode) -> Result<u32> {
+const NR_LABEL: &str = "DLSS 5 Neural Rendering (Visual Enhancer)";
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum TrackMode {
+    Flow(FlowVizMode),
+    NeuralRendering,
+}
+
+impl TrackMode {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Flow(mode) => mode.label(),
+            Self::NeuralRendering => NR_LABEL,
+        }
+    }
+    fn id(self) -> &'static str {
+        match self {
+            Self::Flow(mode) => mode.id(),
+            Self::NeuralRendering => "visualEnhancerNR",
+        }
+    }
+    fn additive_look(self) -> bool {
+        matches!(self, Self::Flow(FlowVizMode::HsvWheel | FlowVizMode::KineticGlow))
+    }
+}
+
+fn parse_blend_index(cmd: &str, name: Option<&str>, mode: TrackMode) -> Result<u32> {
     match name {
         Some(n) => filmcraft_project::effect::BLEND_MODES
             .iter()
             .position(|b| b.eq_ignore_ascii_case(n))
             .and_then(|i| u32::try_from(i).ok())
             .ok_or_else(|| bad(cmd, format!("unknown blendMode `{n}`"))),
-        None => Ok(match mode {
-            FlowVizMode::HsvWheel | FlowVizMode::KineticGlow => Blend::Screen.index(),
-            FlowVizMode::MotionVectors | FlowVizMode::DlssEnhance => Blend::Normal.index(),
-        }),
+        None => Ok(if mode.additive_look() { Blend::Screen.index() } else { Blend::Normal.index() }),
     }
 }
 
 /// How the overlay clips are rendered and composited.
 #[derive(Clone, Copy, Debug)]
 struct Look {
-    mode: FlowVizMode,
+    mode: TrackMode,
     max_motion: f32,
     opacity: f32,
     blend: u32,
@@ -197,6 +231,9 @@ impl Outcome {
     /// Which backend computed the frames: the hardware's name, the CPU, or both when the hardware
     /// failed part way.
     fn backend(&self, hw_name: &str) -> String {
+        if self.hardware_frames == 0 && self.cpu_frames == 0 {
+            return "not run".into();
+        }
         match (self.hardware_frames, self.cpu_frames) {
             (0, _) => CPU_FLOW_BACKEND.to_string(),
             (_, 0) => hw_name.to_string(),
@@ -217,6 +254,9 @@ impl Outcome {
 
     /// Where the overlay frames were drawn, in the same form.
     fn viz_backend(&self) -> String {
+        if self.viz_gpu_frames == 0 && self.viz_cpu_frames == 0 {
+            return "not run".into();
+        }
         let gpu = self.viz_gpu_name.as_deref().unwrap_or("GPU");
         match (self.viz_gpu_frames, self.viz_cpu_frames) {
             (0, _) => "CPU".to_string(),
@@ -251,7 +291,7 @@ fn frames_for(dur: Tick, fd: Tick) -> Option<i64> {
     Some(if dur.0 % fd.0 == 0 { whole } else { whole.saturating_add(1) })
 }
 
-fn run_overlay(s: &mut Session, p: &Value, fixed_mode: Option<FlowVizMode>) -> Result<Value> {
+fn run_overlay(s: &mut Session, p: &Value, fixed_mode: Option<TrackMode>) -> Result<Value> {
     let cmd = "clip.opticalFlowOverlay";
     let seq_id = s.state.active_sequence.ok_or(EngineError::NoSequence)?;
     let clips = video_clips(s, p);
@@ -261,20 +301,24 @@ fn run_overlay(s: &mut Session, p: &Value, fixed_mode: Option<FlowVizMode>) -> R
 
     let mode = match (fixed_mode, str_p(p, "mode")) {
         (Some(m), None) => m,
-        (_, Some(m)) => {
-            FlowVizMode::from_name(m).ok_or_else(|| bad(cmd, format!("unknown mode `{m}` (expected hsvWheel, motionVectors, kineticGlow, dlssEnhance)")))?
-        }
-        (None, None) => FlowVizMode::HsvWheel,
+        (Some(TrackMode::NeuralRendering), Some("visualEnhancerNR")) | (None, Some("visualEnhancerNR")) => TrackMode::NeuralRendering,
+        (Some(TrackMode::NeuralRendering), Some(_)) => return Err(bad(cmd, "mode conflicts with the Neural Rendering command")),
+        (_, Some(m)) => FlowVizMode::from_name(m)
+            .map(TrackMode::Flow)
+            .ok_or_else(|| bad(cmd, format!("unknown mode `{m}` (expected hsvWheel, motionVectors, kineticGlow, dlssEnhance, visualEnhancerNR)")))?,
+        (None, None) => TrackMode::Flow(FlowVizMode::HsvWheel),
     };
 
     let max_motion = f64_p(p, "maxMotion").unwrap_or(16.0);
     if !max_motion.is_finite() || !(0.5..=512.0).contains(&max_motion) {
         return Err(bad(cmd, "`maxMotion` must be between 0.5 and 512.0"));
     }
-    let default_opacity = match mode {
-        FlowVizMode::HsvWheel | FlowVizMode::KineticGlow => 85.0,
-        FlowVizMode::MotionVectors | FlowVizMode::DlssEnhance => 100.0,
-    };
+    let default_opacity = if mode.additive_look() { 85.0 } else { 100.0 };
+    #[cfg(windows)]
+    let external = (mode == TrackMode::NeuralRendering).then(|| visual_enhancer::Settings::from_params(p)).transpose().map_err(|e| bad(cmd, e))?;
+    if mode == TrackMode::NeuralRendering && (!cfg!(windows) || s.services.export_in_memory()) {
+        return Err(bad(cmd, "Visual Enhancer requires a Windows desktop session with local files"));
+    }
     let opacity = f64_p(p, "opacity").unwrap_or(default_opacity);
     if !opacity.is_finite() || !(0.0..=100.0).contains(&opacity) {
         return Err(bad(cmd, "`opacity` must be between 0 and 100"));
@@ -348,6 +392,8 @@ fn run_overlay(s: &mut Session, p: &Value, fixed_mode: Option<FlowVizMode>) -> R
         size: (w, h),
         rate,
         look,
+        #[cfg(windows)]
+        external,
         provider: s.media.full_res_provider(s.project.clone(), s.services.clone()).own_sources(),
         services: s.services.clone(),
         in_memory,
@@ -360,7 +406,11 @@ fn run_overlay(s: &mut Session, p: &Value, fixed_mode: Option<FlowVizMode>) -> R
         let done = prog.done.load(Ordering::Relaxed);
         let r = match r {
             Ok(o) => {
-                *lock(&prog.status) = format!("Rendered {done} frame(s): flow via {}, drawn on {} ({secs:.1}s)", o.backend(&lock(&name)), o.viz_backend());
+                *lock(&prog.status) = if mode == TrackMode::NeuralRendering {
+                    format!("Rendered {done} frame(s) with {NR_LABEL} ({secs:.1}s)")
+                } else {
+                    format!("Rendered {done} frame(s): flow via {}, drawn on {} ({secs:.1}s)", o.backend(&lock(&name)), o.viz_backend())
+                };
                 *lock(&out) = Some(o);
                 Ok(filmcraft_export::Report { frames: done, seconds: secs, render_fps: done as f64 / secs.max(1e-6), ..Default::default() })
             }
@@ -402,6 +452,8 @@ struct JobCtx {
     size: (usize, usize),
     rate: FrameRate,
     look: Look,
+    #[cfg(windows)]
+    external: Option<visual_enhancer::Settings>,
     provider: crate::media_pool::PoolProvider,
     services: Arc<dyn crate::Services>,
     in_memory: bool,
@@ -416,18 +468,32 @@ impl JobCtx {
     fn render_all(&self, work: &[Work], prog: &filmcraft_export::Progress, hw_name: &Mutex<String>) -> std::result::Result<Outcome, String> {
         let mut out = Outcome::default();
         for w in work {
-            match self.render_clip(w, prog, hw_name, &mut out) {
+            let rendered = match self.look.mode {
+                TrackMode::Flow(mode) => self.render_clip(w, mode, prog, hw_name, &mut out),
+                #[cfg(windows)]
+                TrackMode::NeuralRendering => self.render_external(w, prog, &mut out),
+                #[cfg(not(windows))]
+                TrackMode::NeuralRendering => Err("Visual Enhancer requires Windows".into()),
+            };
+            match rendered {
                 Ok(r) => out.clips.push(r),
                 Err(e) => {
-                    remove_files(self.in_memory, out.clips.iter().map(|r| r.path.as_str()).chain([w.path.as_str()]));
-                    return Err(if prog.cancel.load(Ordering::Relaxed) { "Stopped: nothing was changed".to_string() } else { e });
+                    remove_files(self.in_memory, out.clips.iter().map(|r| r.path.as_str()));
+                    return Err(if prog.cancel.load(Ordering::Relaxed) { format!("Stopped: nothing was changed ({e})") } else { e });
                 }
             }
         }
         Ok(out)
     }
 
-    fn render_clip(&self, w: &Work, prog: &filmcraft_export::Progress, hw_name: &Mutex<String>, out: &mut Outcome) -> std::result::Result<Rendered, String> {
+    fn render_clip(
+        &self,
+        w: &Work,
+        mode: FlowVizMode,
+        prog: &filmcraft_export::Progress,
+        hw_name: &Mutex<String>,
+        out: &mut Outcome,
+    ) -> std::result::Result<Rendered, String> {
         let (fw, fh) = self.size;
         let fd = self.rate.frame_duration();
         let mut est = FlowEstimator::new(fw, fh);
@@ -436,7 +502,7 @@ impl JobCtx {
         }
         // the overlay is drawn and colour-encoded on the GPU when the app registered one
         let mut viz = FlowVizEncoder::new();
-        let mut neural = (self.look.mode == FlowVizMode::DlssEnhance).then(|| NeuralEnhancer::new(fw, fh));
+        let mut neural = (mode == FlowVizMode::DlssEnhance).then(|| NeuralEnhancer::new(fw, fh));
         if viz.is_gpu() {
             out.viz_gpu_name = Some(viz.backend());
         }
@@ -496,7 +562,7 @@ impl JobCtx {
                 }
                 (filmcraft_export::ProResMovFrame { rgb, alpha: Some(alpha) }, gpu)
             } else {
-                let (rgb, gpu) = viz.encode(&curr, &field, look.mode, look.max_motion);
+                let (rgb, gpu) = viz.encode(&curr, &field, mode, look.max_motion);
                 (filmcraft_export::ProResMovFrame { rgb, alpha: None }, gpu)
             };
             if on_gpu {
@@ -510,8 +576,8 @@ impl JobCtx {
             Ok(frame)
         });
         // 4444 keeps the UV channels independent and carries source alpha on enhanced clips.
-        let detail = look.mode == FlowVizMode::DlssEnhance;
-        let profile = filmcraft_export::prores_profile(if detail || look.mode == FlowVizMode::MotionVectors { "4444" } else { "standard" });
+        let detail = mode == FlowVizMode::DlssEnhance;
+        let profile = filmcraft_export::prores_profile(if detail || mode == FlowVizMode::MotionVectors { "4444" } else { "standard" });
         let signal = match (detail, pipe.working) {
             (true, filmcraft_color::WorkingSpace::Rec2100Pq) => filmcraft_export::ColorSignal::PQ,
             (true, filmcraft_color::WorkingSpace::Rec2100Hlg) => filmcraft_export::ColorSignal::HLG,
@@ -528,9 +594,16 @@ impl JobCtx {
         } else {
             // a new file only: the name was checked to be free, and nothing else may be overwritten
             let file = std::fs::OpenOptions::new().write(true).create_new(true).open(&w.path).map_err(|e| format!("{}: {e}", w.path))?;
-            let (buf, _) =
-                filmcraft_export::encode_prores_mov_frames(std::io::BufWriter::new(file), w32, h32, self.rate, format, frames).map_err(|e| e.to_string())?;
-            buf.into_inner().map_err(|e| format!("{}: {}", w.path, e.error()))?.sync_all().map_err(|e| format!("{}: {e}", w.path))?;
+            let write = || -> std::result::Result<(), String> {
+                let (buf, _) = filmcraft_export::encode_prores_mov_frames(std::io::BufWriter::new(file), w32, h32, self.rate, format, frames)
+                    .map_err(|e| e.to_string())?;
+                buf.into_inner().map_err(|e| format!("{}: {}", w.path, e.error()))?.sync_all().map_err(|e| format!("{}: {e}", w.path))?;
+                Ok(())
+            };
+            if let Err(e) = write() {
+                remove_files(false, [w.path.as_str()]);
+                return Err(e);
+            }
             None
         };
         out.hardware_frames += hw;

@@ -78,7 +78,9 @@ fn menus_and_shortcuts_follow_premiere() {
             "HSV Neon Flow Wheel",
             "Motion Vectors (UV Pass)",
             "Kinetic Motion Glow",
-            "Temporal Detail Enhancement"
+            "Temporal Detail Enhancement",
+            #[cfg(windows)]
+            "DLSS 5 Neural Rendering (Visual Enhancer)",
         ]
     );
     let sc = |id: &str| crate::commands::find(id).unwrap().shortcut;

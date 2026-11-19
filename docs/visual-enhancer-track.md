@@ -1,0 +1,9 @@
+# Visual Enhancer Neural Rendering track
+
+On this personal Windows branch, select a timeline video clip and choose **Clip ▸ Video Options ▸ Optical Flow Track ▸ DLSS 5 Neural Rendering (Visual Enhancer)**. The job places a silent ProRes 4444 clip above the selection, aligned to its start and duration. Toggle the generated track to compare it with the original. When judging transparency in isolation, hide the source video track underneath. Undo removes the placed clip.
+
+The command uses the portable [Visual Enhancer v23.6 release](https://github.com/Merserk/dlss5-visual-enhancer/releases/tag/v23.6). Extract it to `%LOCALAPPDATA%\FilmCraft-SDKs\VisualEnhancer\v23.6` or set `FILMCRAFT_VE_CLI` to the absolute path to its `VE_CLI.exe` before launching FilmCraft. Keep the release directory layout, including its media tools and the NeuroFrame Neural Rendering runtime. The runtime must support the installed NVIDIA GPU and driver. The tested release archive has SHA-256 `3d01dddae53f02d83a76e3996faf0bb3bcfded7d03b3b80cdd9d01d8a03b4c9f`.
+
+FilmCraft renders the selected source track over the clip's time range at the sequence resolution and frame rate, including timeline effects. It invokes `VE_CLI.exe render` once per clip with just the `neural_model` stage. The tool writes lossless 10-bit RGB video. The final encode restores the staged source alpha, which the model output omits. SDR clips use Rec. 709. Both HDR working spaces export a BT.2020/PQ clip. Allow room in the destination directory for the staged source, the RGB intermediate and the final MOV during each render.
+
+For automation, execute `clip.visualEnhancer.neuralRendering`. Its optional `style` takes 0, 1 or 2 (default 0), and `strength` takes 0–2 (default 1). Pass `wait: true` to receive the placed clip IDs and file paths synchronously. Missing tools and render failures are reported through the job. The separate **Temporal Detail Enhancement** command still uses the existing DLAA/CPU path.
