@@ -48,6 +48,7 @@ craft-docpath = { workspace = true }
 web-time = "1"
 
 [target.'cfg(windows)'.dependencies]
+rayon = { workspace = true }
 tempfile = "3"
 
 [dev-dependencies]

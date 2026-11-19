@@ -383,7 +383,10 @@ fn run_overlay(s: &mut Session, p: &Value, fixed_mode: Option<TrackMode>) -> Res
 
     let id = s.jobs.iter().map(|j| j.id).max().unwrap_or(0) + 1;
     let job = crate::Job { id, label: format!("{LABEL} ({})", mode.label()), progress: Default::default(), result: Default::default() };
-    job.progress.total.store(u64::try_from(total).unwrap_or(0), Ordering::Relaxed);
+    let frames = u64::try_from(total).map_err(|_| bad(cmd, "invalid frame count"))?;
+    // Neural rendering prepares, enhances and encodes each frame, then validates and publishes each clip.
+    let units = if mode == TrackMode::NeuralRendering { frames * 3 + work.len() as u64 } else { frames };
+    job.progress.total.store(units, Ordering::Relaxed);
     let results: Arc<Mutex<Option<Outcome>>> = Arc::default();
     let hw_name: Arc<Mutex<String>> = Arc::new(Mutex::new("hardware".to_string()));
     let ctx = JobCtx {
@@ -403,16 +406,15 @@ fn run_overlay(s: &mut Session, p: &Value, fixed_mode: Option<TrackMode>) -> Res
         let t0 = web_time::Instant::now();
         let r = ctx.render_all(&work, &prog, &name);
         let secs = t0.elapsed().as_secs_f64();
-        let done = prog.done.load(Ordering::Relaxed);
         let r = match r {
             Ok(o) => {
                 *lock(&prog.status) = if mode == TrackMode::NeuralRendering {
-                    format!("Rendered {done} frame(s) with {NR_LABEL} ({secs:.1}s)")
+                    format!("Rendered {frames} frame(s) with {NR_LABEL} ({secs:.1}s)")
                 } else {
-                    format!("Rendered {done} frame(s): flow via {}, drawn on {} ({secs:.1}s)", o.backend(&lock(&name)), o.viz_backend())
+                    format!("Rendered {frames} frame(s): flow via {}, drawn on {} ({secs:.1}s)", o.backend(&lock(&name)), o.viz_backend())
                 };
                 *lock(&out) = Some(o);
-                Ok(filmcraft_export::Report { frames: done, seconds: secs, render_fps: done as f64 / secs.max(1e-6), ..Default::default() })
+                Ok(filmcraft_export::Report { frames, seconds: secs, render_fps: frames as f64 / secs.max(1e-6), ..Default::default() })
             }
             Err(e) => {
                 *lock(&prog.status) = e.clone();

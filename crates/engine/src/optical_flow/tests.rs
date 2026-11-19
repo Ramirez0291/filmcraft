@@ -301,3 +301,26 @@ fn visual_enhancer_places_a_track_and_restores_translucent_pixels() {
     s.execute("edit.undo", json!({})).unwrap();
     assert!(s.project.sequence(seq_id).unwrap().find_item(placed).is_none());
 }
+
+#[cfg(windows)]
+#[test]
+#[ignore = "requires Visual Enhancer v23.6 and a compatible NVIDIA GPU"]
+fn neural_render_reports_progress_before_publishing_the_track() {
+    let (mut s, _, clip, _, _) = demo(12);
+    s.execute("sequence.settings", json!({"width": 320, "height": 192})).unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let job = s.execute("clip.visualEnhancer.neuralRendering", json!({"clips":[clip.0],"dir":dir.path()})).unwrap();
+    let id = job["job"].as_u64().unwrap();
+    let job = s.jobs.iter().find(|j| j.id == id).unwrap();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+    let mut intermediate = false;
+    while !job.progress.finished.load(Ordering::Relaxed) {
+        let fraction = job.progress.fraction();
+        intermediate |= fraction > 0.0 && fraction < 1.0;
+        assert!(std::time::Instant::now() < deadline, "neural render timed out");
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    assert_eq!(job.to_json()["result"]["frames"], 12, "{}", job.to_json());
+    assert!(intermediate, "progress stayed at zero until the track was written");
+    assert_eq!(job.progress.fraction(), 1.0);
+}
