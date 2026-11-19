@@ -2444,6 +2444,7 @@ dependencies = [
  "filmcraft-tts",
  "image",
  "log",
+ "rayon",
  "roxmltree",
  "serde",
  "serde_json",

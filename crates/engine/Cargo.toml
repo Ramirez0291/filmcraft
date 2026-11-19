@@ -47,6 +47,10 @@ chrono = { workspace = true }
 craft-docpath = { workspace = true }
 web-time = "1"
 
+[target.'cfg(windows)'.dependencies]
+rayon = { workspace = true }
+tempfile = "3"
+
 [dev-dependencies]
 filmcraft-testkit = { workspace = true }
 tempfile = "3"
